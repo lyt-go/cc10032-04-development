@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 from typing import Any
 
+from app.schema_compat import check_backward_compatibility, extract_constraints
 from app.seed import SEED_ROWS
 
 
@@ -125,6 +127,10 @@ class Store:
         self._global_changelog: list[dict[str, Any]] = []
         # Schema 注册表（cross-module schema registry）
         self._schema_registry: dict[str, list[dict[str, Any]]] = {}
+        # Schema 注册/发布锁：并发登记时保证只发布经过核验的组合
+        self._schema_lock = threading.Lock()
+        # 进行中的写入任务（表格式按任务启动时核准的 Schema 版本继续写入）
+        self._active_write_tasks: dict[str, dict[str, Any]] = {}
         # 水位偏移记录（watermark → late_data 共享）
         self._watermark_offsets: dict[str, dict[str, Any]] = {}
         # 快照存储表（snapshot_mgr → backfill_job 共享）
@@ -183,25 +189,167 @@ class Store:
         return dict(self._pipelines)
 
     # ---------- Schema 注册表 ----------
-    def register_schema(self, topic: str, schema_def: dict[str, Any], version: str) -> dict[str, Any]:
-        versions = self._schema_registry.setdefault(topic, [])
-        entry = {"topic": topic, "definition": schema_def, "version": version, "ts": time.time()}
-        versions.append(entry)
+    def register_schema(self, topic: str, schema_def: dict[str, Any], version: str,
+                        *, status: str = "published",
+                        compatibility: dict[str, Any] | None = None,
+                        base_version: str | None = None) -> dict[str, Any]:
+        """低层登记一个 Schema 版本（默认已发布，供既有调用方与测试打底数据使用）。
+
+        治理路径应使用 add_schema_candidate + publish_schema，
+        保证只发布经过核验的字段约束和注册版本组合。
+        """
+        entry = {
+            "topic": topic,
+            "definition": schema_def,
+            "version": version,
+            "ts": time.time(),
+            "status": status,
+            "base_version": base_version,
+            "compatibility": compatibility,
+            "constraints": extract_constraints(schema_def),
+            "approval_basis": None,
+        }
+        with self._schema_lock:
+            self._schema_registry.setdefault(topic, []).append(entry)
         return entry
 
     def schema_versions(self, topic: str) -> list[dict[str, Any]]:
         return self._schema_registry.get(topic, [])
 
+    def published_schema_versions(self, topic: str) -> list[dict[str, Any]]:
+        """仅已核准（已发布）的版本：表格式只消费这个清单。"""
+        return [v for v in self.schema_versions(topic) if v.get("status") == "published"]
+
+    def latest_published_schema(self, topic: str) -> dict[str, Any] | None:
+        published = self.published_schema_versions(topic)
+        return published[-1] if published else None
+
+    def find_schema_version(self, topic: str, version: str) -> dict[str, Any] | None:
+        for v in self.schema_versions(topic):
+            if v.get("version") == version:
+                return v
+        return None
+
+    def find_schema_candidate(self, topic: str, version: str) -> dict[str, Any] | None:
+        """查找待启用/已拒绝的候选版本（已发布版本不可再作为候选）。"""
+        for v in self.schema_versions(topic):
+            if v.get("version") == version and v.get("status") in ("candidate", "rejected"):
+                return v
+        return None
+
+    def add_schema_candidate(self, topic: str, schema_def: dict[str, Any], version: str,
+                             *, base_version: str | None,
+                             compatibility: dict[str, Any]) -> dict[str, Any]:
+        """校验结论同步到注册清单：登记或刷新待启用候选版本。"""
+        with self._schema_lock:
+            existing = self.find_schema_candidate(topic, version)
+            if existing is not None:
+                existing.update({
+                    "definition": schema_def,
+                    "base_version": base_version,
+                    "compatibility": compatibility,
+                    "constraints": extract_constraints(schema_def),
+                    "status": "candidate",
+                    "ts": time.time(),
+                })
+                return existing
+            entry = {
+                "topic": topic,
+                "definition": schema_def,
+                "version": version,
+                "ts": time.time(),
+                "status": "candidate",
+                "base_version": base_version,
+                "compatibility": compatibility,
+                "constraints": extract_constraints(schema_def),
+                "approval_basis": None,
+            }
+            self._schema_registry.setdefault(topic, []).append(entry)
+            return entry
+
+    def publish_schema(self, topic: str, version: str,
+                       *, expected_base: str | None = None) -> dict[str, Any]:
+        """确认发布候选版本（并发安全）。
+
+        - 只发布经过核验（校验结论 compatible）的字段约束与注册版本组合
+        - expected_base 与当前最新已发布版本不一致时判定为并发冲突：
+          按实际最新版本重新核验，并在待启用定义上记录实际核准依据
+        """
+        with self._schema_lock:
+            candidate = self.find_schema_candidate(topic, version)
+            if candidate is None:
+                return {"ok": False, "conflict": False,
+                        "reason": f"主题 {topic} 版本 {version} 无待启用候选"}
+            latest = self.latest_published_schema(topic)
+            actual_base = latest.get("version") if latest else None
+            conflict = actual_base != expected_base
+            report = candidate.get("compatibility") or {
+                "compatible": False, "reason": "未经过兼容性核验", "details": [],
+            }
+            original_verdict = report.get("compatible")
+            if conflict:
+                # 另一候选已先注册：按实际最新已发布版本重新核验
+                base_def = latest.get("definition") if latest else {"fields": []}
+                report = check_backward_compatibility(base_def, candidate.get("definition"))
+            candidate["approval_basis"] = {
+                "original_base_version": expected_base,
+                "actual_base_version": actual_base,
+                "original_verdict": original_verdict,
+                "revalidated": conflict,
+                "report": report,
+                "ts": time.time(),
+            }
+            if not report.get("compatible"):
+                candidate["status"] = "rejected"
+                return {"ok": False, "conflict": conflict,
+                        "reason": f"版本 {version} 核验未通过: {report.get('reason')}",
+                        "report": report}
+            candidate["status"] = "published"
+            candidate["compatibility"] = report
+            candidate["published_ts"] = time.time()
+            return {"ok": True, "conflict": conflict, "topic": topic, "version": version,
+                    "base_version": actual_base, "report": report}
+
     def check_schema_compatibility(self, topic: str, new_fields: list[str]) -> dict[str, Any]:
-        versions = self.schema_versions(topic)
-        if not versions:
+        base = self.latest_published_schema(topic)
+        if base is None:
             return {"compatible": True, "reason": "新主题，无兼容性问题"}
-        latest = versions[-1]
-        old_fields = set(latest.get("definition", {}).get("fields", []))
-        missing_required = [f for f in old_fields if f not in new_fields]
-        if missing_required:
-            return {"compatible": False, "reason": f"缺少已有字段: {missing_required}"}
-        return {"compatible": True, "reason": "向后兼容"}
+        report = check_backward_compatibility(base.get("definition"), {"fields": list(new_fields)})
+        return {"compatible": report["compatible"], "reason": report["reason"]}
+
+    # ---------- 写入任务（表格式按核准版本固定写入约束） ----------
+    def start_write_task(self, table: str, task_id: str | None = None) -> dict[str, Any] | None:
+        """开始写入任务：固定当前已核准的字段约束与注册版本组合。
+
+        已有进行中的任务时直接返回原任务：已经开始写入的任务按原版本继续。
+        """
+        with self._schema_lock:
+            existing = self._active_write_tasks.get(table)
+            if existing is not None:
+                return existing
+            latest = self.latest_published_schema(table)
+            if latest is None:
+                return None
+            constraints = {
+                name: dict(constraint)
+                for name, constraint in (latest.get("constraints") or {}).items()
+            }
+            task = {
+                "table": table,
+                "task_id": task_id or f"WT-{table}-{int(time.time() * 1000)}",
+                "schema_version": latest.get("version"),
+                "constraints": constraints,
+                "started_ts": time.time(),
+            }
+            self._active_write_tasks[table] = task
+            return task
+
+    def active_write_task(self, table: str) -> dict[str, Any] | None:
+        return self._active_write_tasks.get(table)
+
+    def finish_write_task(self, table: str) -> dict[str, Any] | None:
+        with self._schema_lock:
+            return self._active_write_tasks.pop(table, None)
 
     # ---------- 水位记录 ----------
     def update_watermark(self, partition: str, offset: dict[str, Any]) -> None:

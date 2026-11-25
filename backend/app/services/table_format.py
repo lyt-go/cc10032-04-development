@@ -4,11 +4,12 @@
 1. 表格式配置：表格式类型（Iceberg/Hudi/Delta）、主键列、分区列、写入模式
 2. 表格式治理链路：lineage → table_format（血缘关系决定表格式选择）
 3. 失败场景：表格式切换不兼容、写入模式冲突、合并引擎错误
-4. 与上下游流水线：消费 lineage 血缘信息；消费 schema_govern 的Schema版本
+4. 与上下游流水线：消费 lineage 血缘信息；消费 schema_govern 已核准的Schema版本，
+   按核准版本的字段约束决定可写字段；已经开始写入的任务按原版本继续
 
 跨模块数据流：
   lineage → table_format（血缘追踪结果决定表格式写入策略）
-  schema_govern → table_format（Schema版本影响表格式主键和分区配置）
+  schema_govern → table_format（已核准Schema版本决定可写字段与主键分区配置）
 """
 from __future__ import annotations
 
@@ -72,6 +73,7 @@ class TableFormatService(BaseModuleService):
         """基于上游 lineage 和 schema_govern 信息解析写入策略。
 
         这是 lineage → table_format 和 schema_govern → table_format 贯通数据流的核心方法。
+        可写字段由已核准（已发布）的 Schema 版本决定；已经开始写入的任务按原版本继续。
         """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
@@ -89,17 +91,34 @@ class TableFormatService(BaseModuleService):
             for e in edges if e.get("downstream") == table_name
         )
 
-        # 消费 schema_govern 的最新版本
-        schema_versions = store.schema_versions(table_name)
-        latest_schema = schema_versions[-1] if schema_versions else None
+        # 只消费 schema_govern 已核准（已发布）的 Schema 版本
+        approved_schema = store.latest_published_schema(table_name)
 
-        # 基于血缘和Schema决策写入策略
+        # 已经开始写入的任务按原版本继续
+        active_task = store.active_write_task(table_name)
+        if active_task is not None:
+            schema_version = active_task.get("schema_version")
+            constraints = active_task.get("constraints") or {}
+            continues_original = True
+        elif approved_schema is not None:
+            schema_version = approved_schema.get("version")
+            constraints = approved_schema.get("constraints") or {}
+            continues_original = False
+        else:
+            schema_version = None
+            constraints = {}
+            continues_original = False
+
+        # 基于血缘和已核准Schema决策写入策略
         strategy = {
             "format": fmt,
             "table": table_name,
             "lineage_upstream_count": upstream_count,
             "lineage_downstream_count": len(lineage_info),
-            "schema_version": latest_schema.get("version") if latest_schema else None,
+            "schema_version": schema_version,
+            "writable_fields": sorted(constraints),
+            "field_constraints": constraints,
+            "write_task_continues_original": continues_original,
         }
 
         # 根据血缘复杂度选择写入模式
@@ -110,10 +129,9 @@ class TableFormatService(BaseModuleService):
             strategy["recommended_write_mode"] = "append"
             strategy["reason"] = "血缘关系简单，使用append模式"
 
-        # 根据Schema字段数量选择主键策略
-        if latest_schema:
-            fields = latest_schema.get("definition", {}).get("fields", [])
-            if len(fields) > 10:
+        # 根据已核准Schema字段数量选择主键策略
+        if constraints:
+            if len(constraints) > 10:
                 strategy["partition_recommendation"] = "按时间分区"
             else:
                 strategy["partition_recommendation"] = "按主键分区"
@@ -127,7 +145,47 @@ class TableFormatService(BaseModuleService):
             **strategy,
         }
 
+    def begin_write_task(self, entry_id: int) -> dict[str, Any]:
+        """开始写入任务：固定当前已核准的字段约束与注册版本组合。
+
+        任务进行中即使有新版本发布，也按启动时核准的原版本继续写入。
+        """
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "reason": f"配置 {entry_id} 不存在"}
+        if entry.get("status") != "已生效":
+            return {"ok": False, "reason": f"配置未生效，当前状态: {entry.get('status')}"}
+
+        table_name = str(entry.get("目标表", ""))
+        task = store.start_write_task(table_name)
+        if task is None:
+            return {"ok": False, "reason": f"表 {table_name} 无已核准的Schema版本，无法开始写入"}
+        return {
+            "ok": True,
+            "table": table_name,
+            "task_id": task.get("task_id"),
+            "schema_version": task.get("schema_version"),
+            "writable_fields": sorted(task.get("constraints") or {}),
+        }
+
+    def finish_write_task(self, entry_id: int) -> dict[str, Any]:
+        """结束写入任务：释放版本固定，后续写入按最新核准版本执行。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "reason": f"配置 {entry_id} 不存在"}
+        table_name = str(entry.get("目标表", ""))
+        task = store.finish_write_task(table_name)
+        if task is None:
+            return {"ok": False, "reason": f"表 {table_name} 无进行中的写入任务"}
+        return {
+            "ok": True,
+            "table": table_name,
+            "finished_task": task.get("task_id"),
+            "schema_version": task.get("schema_version"),
+        }
+
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
         base["active_configs"] = sum(1 for r in store.rows(self.MODULE) if r.get("status") == "已生效")
+        base["active_write_tasks"] = len(store._active_write_tasks)
         return base
